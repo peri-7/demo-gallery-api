@@ -10,9 +10,13 @@
     "dev": "node --watch --env-file=.env src/index.js",
     "start": "node src/index.js",
     "migrate": "node --env-file=.env src/migrate.js",
-    "migrate:prod": "node --env-file=.env.production src/migrate.js"
+    "migrate:prod": "node --env-file=.env.production src/migrate.js",
+    "check:storage": "node --env-file=.env scripts/check-storage.mjs",
+    "check:api": "node scripts/check-api.mjs"
   },
   "dependencies": {
+    "@aws-sdk/client-s3": "^3.1125.0",
+    "@aws-sdk/s3-request-presigner": "^3.1125.0",
     "express": "^5.1.0",
     "pg": "^8.23.0"
   }
