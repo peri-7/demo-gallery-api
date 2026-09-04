@@ -41,6 +41,12 @@ const ORDERS = ["asc", "desc"];
 const DEFAULT_SORT = "year";
 const DEFAULT_ORDER = "desc";
 
+// Page size. The default is what a caller gets for asking nothing; the maximum
+// is what protects the server from a caller asking for everything. `?limit=
+// 1000000` must not be a way to make us build a hundred-megabyte JSON string.
+const DEFAULT_LIMIT = 20;
+const MAX_LIMIT = 100;
+
 /**
  * Build the ORDER BY clause from an already-validated sort key.
  *
@@ -94,9 +100,13 @@ function buildOrderBy(sort, order) {
  * string. Values go in the array; the string is only ever assembled from our
  * own column names plus a number we counted.
  */
-function buildWhere(filters) {
+function buildWhere(filters, keyset) {
   const clauses = [];
   const params = [];
+
+  if (keyset !== null) {
+    clauses.push(keysetClause(keyset, params));
+  }
 
   if (filters.year !== undefined) {
     params.push(filters.year);
@@ -138,6 +148,106 @@ function buildWhere(filters) {
   const sql = clauses.length === 0 ? "" : `where ${clauses.join(" and ")}`;
   return { sql, params };
 }
+
+/**
+ * "Everything after this row", expressed so the index can seek to it.
+ *
+ * `(year, id) < ($1, $2)` is a ROW-VALUE comparison: it compares the pair
+ * lexicographically, which is precisely how a two-column index is ordered. That
+ * is why the plan shows it as an Index Cond rather than a Filter — the database
+ * seeks straight to the position instead of reading rows and discarding them.
+ *
+ * It is NOT equivalent to `year <= $1 and id < $2`, which drops every row that
+ * has a smaller year but a larger id. That version looks right, passes a casual
+ * test, and silently loses rows. Write the row comparison.
+ *
+ * Nulls are the hard part, and the reason keyset pagination has a reputation
+ * for being fiddly. A row comparison involving NULL evaluates to NULL, not
+ * true, so unrated drawings would vanish from every page after the first. Our
+ * ordering treats NULL as the smallest value (see buildOrderBy), so the null
+ * region sits at the end when descending and at the start when ascending, and
+ * the clause has to say which side of it we are on.
+ *
+ * This is a concrete argument for NOT NULL columns wherever the domain allows
+ * it. Here it doesn't — "unrated" is a real state — so we pay the complexity.
+ */
+function keysetClause({ sort, order, value, id }, params) {
+  const { column, nullable } = SORTS[sort];
+  const cmp = order === "desc" ? "<" : ">";
+
+  const bind = (v) => {
+    params.push(v);
+    return `$${params.length}`;
+  };
+
+  if (!nullable) {
+    return `(${column}, id) ${cmp} (${bind(value)}, ${bind(id)})`;
+  }
+
+  if (value === null) {
+    // The previous page ended inside the null region.
+    const i = bind(id);
+    return order === "desc"
+      // Descending: nulls are last, so nothing follows them but more nulls.
+      ? `(${column} is null and id < ${i})`
+      // Ascending: nulls are first, so the rest of the nulls come next, and
+      // then the entire non-null population.
+      : `((${column} is null and id > ${i}) or ${column} is not null)`;
+  }
+
+  const v = bind(value);
+  const i = bind(id);
+  return order === "desc"
+    // Descending: smaller values, then the null region we have not reached yet.
+    // Without `or ... is null` every unrated drawing disappears after page 1.
+    ? `((${column}, id) < (${v}, ${i}) or ${column} is null)`
+    // Ascending: the nulls came first and are already behind us.
+    : `(${column}, id) > (${v}, ${i})`;
+}
+
+/**
+ * Cursors are opaque strings, on purpose.
+ *
+ * base64 is NOT encryption and nothing here is secret — anyone can decode it,
+ * and that is fine, because it contains only values the caller can already see
+ * in the response. Opacity is a CONTRACT, not a security measure: it tells the
+ * client "do not construct or parse this", which leaves us free to change what
+ * is inside without breaking anyone. A cursor of `?after=1907` would become a
+ * public API the moment someone hand-wrote one.
+ *
+ * The cursor still arrives from the network, so it is untrusted like everything
+ * else. Decoding validates the shape and returns null on anything unexpected —
+ * base64 of arbitrary bytes, valid base64 of invalid JSON, valid JSON of the
+ * wrong shape. Every one of those is a 400, never a crash.
+ */
+function encodeCursor({ sort, order, value, id }) {
+  // base64url, not base64: the standard alphabet contains "+" and "/", which
+  // have meaning in a URL and would need escaping every time.
+  return Buffer.from(JSON.stringify({ s: sort, o: order, v: value, i: id })).toString("base64url");
+}
+
+function decodeCursor(raw) {
+  if (typeof raw !== "string" || raw.length === 0 || raw.length > 512) return null;
+  let parsed;
+  try {
+    parsed = JSON.parse(Buffer.from(raw, "base64url").toString("utf8"));
+  } catch {
+    return null;
+  }
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+
+  const { s: sort, o: order, v: value, i: id } = parsed;
+  if (typeof sort !== "string" || !Object.hasOwn(SORTS, sort)) return null;
+  if (typeof order !== "string" || !ORDERS.includes(order)) return null;
+  if (typeof id !== "string" || !UUID_RE.test(id)) return null;
+  // The sort value is a number, a string (numeric and timestamptz both arrive
+  // as strings from pg) or null for an unrated drawing. Nothing else.
+  if (value !== null && typeof value !== "number" && typeof value !== "string") return null;
+
+  return { sort, order, value, id };
+}
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
 /**
  * Parse one query-string value that is supposed to be a number.
@@ -251,7 +361,38 @@ function parseListQuery(q) {
     }
   }
 
-  return { errors, value: { sort, order, filters } };
+  // --- paging ----------------------------------------------------------
+  let limit = DEFAULT_LIMIT;
+  if (q.limit !== undefined) {
+    const n = parseNumber(q.limit, { integer: true });
+    // Note that an over-large limit is an ERROR, not silently clamped to 100.
+    // Clamping would answer a different question than the one asked, and the
+    // caller would have no way to tell — they would page through 1,000,000
+    // records 100 at a time believing they had them all.
+    if (n === null || n < 1 || n > MAX_LIMIT) {
+      errors.push(`limit must be an integer between 1 and ${MAX_LIMIT}`);
+    } else {
+      limit = n;
+    }
+  }
+
+  let cursor = null;
+  if (q.cursor !== undefined) {
+    cursor = decodeCursor(q.cursor);
+    if (cursor === null) {
+      errors.push("cursor is not valid");
+    } else if (cursor.sort !== sort || cursor.order !== order) {
+      // A cursor means "after this row IN THIS ORDERING". Reusing it under a
+      // different sort is meaningless — the row it names isn't in that position
+      // any more — and would return a plausible-looking, wrong page. Changing
+      // the sort has to restart from the beginning, and saying so is kinder
+      // than silently obliging.
+      errors.push(`cursor was issued for sort=${cursor.sort}&order=${cursor.order}`);
+      cursor = null;
+    }
+  }
+
+  return { errors, value: { sort, order, filters, limit, cursor } };
 }
 
 // GET /api/drawings?sort=year&order=desc
@@ -267,25 +408,60 @@ drawingsRouter.get("/", async (req, res) => {
   if (parsed.errors.length > 0) {
     return res.status(400).json({ error: "Invalid query", details: parsed.errors });
   }
-  const { sort, order, filters } = parsed.value;
+  const { sort, order, filters, limit, cursor } = parsed.value;
 
-  const where = buildWhere(filters);
+  const where = buildWhere(filters, cursor);
+
+  // Ask for one more row than we intend to return.
+  //
+  // That extra row answers "is there a next page?" for the price of reading one
+  // row. The obvious alternative — a second `select count(*)` — makes the
+  // database scan every matching row on every request just to produce a number
+  // the user rarely needs, and it is the reason so many admin dashboards are
+  // slow. If a total is genuinely required, that is a deliberate, separate,
+  // more expensive endpoint.
+  where.params.push(limit + 1);
+  const limitPlaceholder = `$${where.params.length}`;
 
   const { rows } = await query(
     `select id, title, artist, year, rating, created_at,
             storage_key, content_type, size_bytes
        from drawings
       ${where.sql}
-      ${buildOrderBy(sort, order)}`,
+      ${buildOrderBy(sort, order)}
+      limit ${limitPlaceholder}`,
     where.params
   );
 
+  const hasMore = rows.length > limit;
+  const page = hasMore ? rows.slice(0, limit) : rows;
+
+  // The cursor is built from the LAST ROW WE ARE RETURNING, using the raw
+  // database value rather than the shape we send to the client. toApiShape
+  // converts rating to a number and created_at to a string for presentation;
+  // the cursor has to round-trip back into a WHERE clause, so it carries what
+  // Postgres gave us.
+  const last = page.at(-1);
+  const nextCursor =
+    hasMore && last !== undefined
+      ? encodeCursor({ sort, order, value: last[SORTS[sort].column], id: last.id })
+      : null;
+
   // An object, not a bare array — and this is the stage where that pays off.
   // Echoing back what was actually applied means a client never has to assume
-  // its request was honoured, and a total count or a cursor can be added later
-  // without breaking a single existing caller. A bare array had nowhere to put
-  // any of this.
-  res.json({ drawings: rows.map(toApiShape), sort, order, filters });
+  // its request was honoured, and the cursor has somewhere to live. A bare
+  // array had nowhere to put any of this, and adding it later would have broken
+  // every existing caller.
+  res.json({
+    drawings: page.map(toApiShape),
+    sort,
+    order,
+    filters,
+    limit,
+    // null, not absent: "there is no next page" is a fact worth stating. An
+    // absent field is indistinguishable from a field the server forgot to send.
+    nextCursor,
+  });
 });
 
 // POST /api/drawings/upload-url
