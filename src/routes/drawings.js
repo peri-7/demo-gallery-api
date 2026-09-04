@@ -78,6 +78,93 @@ function buildOrderBy(sort, order) {
 }
 
 /**
+ * Build the WHERE clause and its parameter list together.
+ *
+ * Unlike ORDER BY, the number of conditions varies per request, and that is the
+ * whole difficulty. The SQL text and the values array must stay in lockstep: if
+ * a clause says `$3` and the third element of the array is something else, the
+ * query does not fail — it silently returns the wrong rows. A test with one
+ * filter would pass and a request with three would quietly lie.
+ *
+ * The trick that makes drift impossible: never write a placeholder number by
+ * hand. Push the value first, then derive the number from the array's new
+ * length. The two cannot disagree because one is computed from the other.
+ *
+ * Note what is NOT happening: no caller-supplied character reaches the SQL
+ * string. Values go in the array; the string is only ever assembled from our
+ * own column names plus a number we counted.
+ */
+function buildWhere(filters) {
+  const clauses = [];
+  const params = [];
+
+  if (filters.year !== undefined) {
+    params.push(filters.year);
+    clauses.push(`year = $${params.length}`);
+  }
+
+  if (filters.minRating !== undefined) {
+    // A NULL rating fails this comparison rather than matching it — `null >= 4`
+    // is NULL, not false, and WHERE keeps only rows that are true. That is the
+    // behaviour we want (unrated is not "at least 4"), but it is worth knowing
+    // it happened by three-valued logic rather than by a check we wrote.
+    params.push(filters.minRating);
+    clauses.push(`rating >= $${params.length}`);
+  }
+
+  if (filters.artist !== undefined) {
+    // The wildcards are concatenated INSIDE the query, around a bound value —
+    // not glued onto the string in JavaScript. Either produces the same match,
+    // but this way the value never touches the SQL text, so there is nothing to
+    // reason about. Make the safe thing the habit, not the special case.
+    //
+    // ilike is case-insensitive. Honest cost: a leading % means no btree index
+    // can help, so this is a sequential scan over every row. Fine at eight
+    // rows, wrong at a million — the real fix there is a trigram index
+    // (pg_trgm), which is a different tool, not a bigger version of this one.
+    params.push(filters.artist);
+    clauses.push(`artist ilike '%' || $${params.length} || '%'`);
+  }
+
+  if (filters.hasImage !== undefined) {
+    // No parameter at all: the value chooses between two fixed SQL fragments,
+    // the same allowlist technique as sorting. `is not null` cannot be a bound
+    // value any more than a column name can.
+    clauses.push(filters.hasImage ? "storage_key is not null" : "storage_key is null");
+  }
+
+  // No filters means no WHERE clause at all, not `where true`. Keep the SQL you
+  // send the same shape as the SQL you would have written by hand.
+  const sql = clauses.length === 0 ? "" : `where ${clauses.join(" and ")}`;
+  return { sql, params };
+}
+
+/**
+ * Parse one query-string value that is supposed to be a number.
+ *
+ * A query string can only express STRINGS. `?year=1889` arrives as "1889" and
+ * there is no encoding in which it could arrive as the number 1889 — so unlike
+ * the JSON body, where we refuse to coerce "2026" and return a 400, here
+ * conversion is mandatory.
+ *
+ * That is not a contradiction. The rule was never "never coerce"; it is "know
+ * what your transport can express, and reject anything it can express that you
+ * did not mean". JSON has real types, so a string year is a client bug. A query
+ * string has no types, so a string year is the only thing possible.
+ *
+ * Number() rather than parseInt(), deliberately: parseInt("12abc") returns 12
+ * and parseInt("1e3") returns 1. The regex settles the shape first and Number
+ * then converts something already known to be a clean numeral.
+ */
+function parseNumber(raw, { integer }) {
+  if (typeof raw !== "string") return null;
+  const pattern = integer ? /^\d+$/ : /^\d+(\.\d+)?$/;
+  if (!pattern.test(raw)) return null;
+  const n = Number(raw);
+  return Number.isFinite(n) ? n : null;
+}
+
+/**
  * Validate the query string.
  *
  * `?sort=year` looks like configuration rather than input because it sits in
@@ -109,7 +196,62 @@ function parseListQuery(q) {
     errors.push(`order must be one of: ${ORDERS.join(", ")}`);
   }
 
-  return { errors, value: { sort, order } };
+  // --- filters, all optional -------------------------------------------
+  //
+  // `undefined` means "the caller did not filter on this" and is left out of
+  // the WHERE clause entirely. That is different from a value we rejected,
+  // which is an error — never a silently-dropped filter. A search that quietly
+  // ignores half your criteria and returns confident-looking results is worse
+  // than one that fails.
+  const filters = {};
+
+  if (q.year !== undefined) {
+    const year = parseNumber(q.year, { integer: true });
+    // Same bounds as the CHECK constraint in migrations/001. Not because the
+    // database would be harmed by year=99999 — no row can match it — but
+    // because a query outside the possible range is certainly a mistake, and
+    // saying so beats returning an empty list that looks like a real answer.
+    if (year === null || year < 1000 || year > 2100) {
+      errors.push("year must be an integer between 1000 and 2100");
+    } else {
+      filters.year = year;
+    }
+  }
+
+  if (q.minRating !== undefined) {
+    const minRating = parseNumber(q.minRating, { integer: false });
+    if (minRating === null || minRating < 0 || minRating > 5) {
+      errors.push("minRating must be a number between 0 and 5");
+    } else {
+      filters.minRating = minRating;
+    }
+  }
+
+  if (q.artist !== undefined) {
+    // Bounded on purpose. An unbounded search term is an unbounded pattern for
+    // the database to match against every row — the length limit is as much a
+    // resource control as a validation rule.
+    const artist = typeof q.artist === "string" ? q.artist.trim() : "";
+    if (artist.length < 1 || artist.length > 80) {
+      errors.push("artist must be 1-80 characters");
+    } else {
+      filters.artist = artist;
+    }
+  }
+
+  if (q.hasImage !== undefined) {
+    // "true"/"false" as strings, because a query string has no booleans. Note
+    // what is NOT used here: Boolean(q.hasImage), which returns true for the
+    // string "false" — one of the most reliable ways to ship a filter that
+    // does the opposite of what it says.
+    if (q.hasImage !== "true" && q.hasImage !== "false") {
+      errors.push('hasImage must be "true" or "false"');
+    } else {
+      filters.hasImage = q.hasImage === "true";
+    }
+  }
+
+  return { errors, value: { sort, order, filters } };
 }
 
 // GET /api/drawings?sort=year&order=desc
@@ -125,21 +267,25 @@ drawingsRouter.get("/", async (req, res) => {
   if (parsed.errors.length > 0) {
     return res.status(400).json({ error: "Invalid query", details: parsed.errors });
   }
-  const { sort, order } = parsed.value;
+  const { sort, order, filters } = parsed.value;
+
+  const where = buildWhere(filters);
 
   const { rows } = await query(
     `select id, title, artist, year, rating, created_at,
             storage_key, content_type, size_bytes
        from drawings
-      ${buildOrderBy(sort, order)}`
+      ${where.sql}
+      ${buildOrderBy(sort, order)}`,
+    where.params
   );
 
   // An object, not a bare array — and this is the stage where that pays off.
-  // Echoing the applied sort back means a client never has to assume its
-  // request was honoured, and a total count or a cursor can be added later
+  // Echoing back what was actually applied means a client never has to assume
+  // its request was honoured, and a total count or a cursor can be added later
   // without breaking a single existing caller. A bare array had nowhere to put
   // any of this.
-  res.json({ drawings: rows.map(toApiShape), sort, order });
+  res.json({ drawings: rows.map(toApiShape), sort, order, filters });
 });
 
 // POST /api/drawings/upload-url
