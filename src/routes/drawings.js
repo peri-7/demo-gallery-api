@@ -15,7 +15,387 @@ import {
 // without touching a single route.
 export const drawingsRouter = Router();
 
-// GET /api/drawings
+// The sort allowlist.
+//
+// A column name is SYNTAX, not a value, so it can never be a bound parameter:
+// `order by $1` does not sort by the column you name — Postgres parses the
+// statement before the parameters arrive, sees a constant, and sorts by
+// nothing. Silently. No error, wrong answer.
+//
+// That rules out the defence we use everywhere else, so sorting needs a
+// different one. The client's string is never escaped, never sanitised, and
+// never concatenated into SQL. It is a KEY INTO THIS MAP. What reaches the
+// query is our value; theirs only ever chose between things we already wrote.
+//
+// `sort=year); drop table drawings--` is not dangerous here because it is not
+// dangerous anywhere: it simply isn't a key, and the request is a 400.
+const SORTS = {
+  // nullable matters for more than correctness — see buildOrderBy.
+  year: { column: "year", nullable: false },
+  rating: { column: "rating", nullable: true },
+  created_at: { column: "created_at", nullable: false },
+};
+
+const ORDERS = ["asc", "desc"];
+
+const DEFAULT_SORT = "year";
+const DEFAULT_ORDER = "desc";
+
+// Page size. The default is what a caller gets for asking nothing; the maximum
+// is what protects the server from a caller asking for everything. `?limit=
+// 1000000` must not be a way to make us build a hundred-megabyte JSON string.
+const DEFAULT_LIMIT = 20;
+const MAX_LIMIT = 100;
+
+/**
+ * Build the ORDER BY clause from an already-validated sort key.
+ *
+ * Every fragment here comes from SORTS or from a two-element literal list. No
+ * caller-supplied character reaches the SQL string. That is the only reason a
+ * template literal is acceptable in a query at all, and it is worth being
+ * suspicious of every other one you ever see.
+ */
+function buildOrderBy(sort, order) {
+  const { column, nullable } = SORTS[sort];
+
+  // The tiebreaker follows the same direction as the main key. Without `id`,
+  // rows sharing a year have NO defined order — two identical requests may
+  // return them differently, and pagination built on that is broken from the
+  // start. See the index in migrations/001, which was created with this in mind.
+  const tiebreak = `id ${order}`;
+
+  if (!nullable) return `order by ${column} ${order}, ${tiebreak}`;
+
+  // Nulls need an explicit position, for two separate reasons.
+  //
+  // MEANING: Postgres's default is nulls-first when descending and nulls-last
+  // when ascending — i.e. NULL is treated as the LARGEST value. For a rating,
+  // that puts every unrated drawing above the 5-star ones. We want the
+  // opposite: unrated sorts below everything.
+  //
+  // PERFORMANCE: an index records a null position too. migrations/001 created
+  // (rating desc nulls last, id desc). A query asking for `nulls first` cannot
+  // use it, and a query asking for ascending order uses it by scanning
+  // BACKWARDS — which yields `rating asc nulls first`. So the clause below is
+  // not just our preferred meaning, it is the one shape that stays indexed in
+  // both directions. Sort order and index definition are one decision, not two.
+  const nulls = order === "desc" ? "nulls last" : "nulls first";
+  return `order by ${column} ${order} ${nulls}, ${tiebreak}`;
+}
+
+/**
+ * Build the WHERE clause and its parameter list together.
+ *
+ * Unlike ORDER BY, the number of conditions varies per request, and that is the
+ * whole difficulty. The SQL text and the values array must stay in lockstep: if
+ * a clause says `$3` and the third element of the array is something else, the
+ * query does not fail — it silently returns the wrong rows. A test with one
+ * filter would pass and a request with three would quietly lie.
+ *
+ * The trick that makes drift impossible: never write a placeholder number by
+ * hand. Push the value first, then derive the number from the array's new
+ * length. The two cannot disagree because one is computed from the other.
+ *
+ * Note what is NOT happening: no caller-supplied character reaches the SQL
+ * string. Values go in the array; the string is only ever assembled from our
+ * own column names plus a number we counted.
+ */
+function buildWhere(filters, keyset) {
+  const clauses = [];
+  const params = [];
+
+  if (keyset !== null) {
+    clauses.push(keysetClause(keyset, params));
+  }
+
+  if (filters.year !== undefined) {
+    params.push(filters.year);
+    clauses.push(`year = $${params.length}`);
+  }
+
+  if (filters.minRating !== undefined) {
+    // A NULL rating fails this comparison rather than matching it — `null >= 4`
+    // is NULL, not false, and WHERE keeps only rows that are true. That is the
+    // behaviour we want (unrated is not "at least 4"), but it is worth knowing
+    // it happened by three-valued logic rather than by a check we wrote.
+    params.push(filters.minRating);
+    clauses.push(`rating >= $${params.length}`);
+  }
+
+  if (filters.artist !== undefined) {
+    // The wildcards are concatenated INSIDE the query, around a bound value —
+    // not glued onto the string in JavaScript. Either produces the same match,
+    // but this way the value never touches the SQL text, so there is nothing to
+    // reason about. Make the safe thing the habit, not the special case.
+    //
+    // ilike is case-insensitive. Honest cost: a leading % means no btree index
+    // can help, so this is a sequential scan over every row. Fine at eight
+    // rows, wrong at a million — the real fix there is a trigram index
+    // (pg_trgm), which is a different tool, not a bigger version of this one.
+    params.push(filters.artist);
+    clauses.push(`artist ilike '%' || $${params.length} || '%'`);
+  }
+
+  if (filters.hasImage !== undefined) {
+    // No parameter at all: the value chooses between two fixed SQL fragments,
+    // the same allowlist technique as sorting. `is not null` cannot be a bound
+    // value any more than a column name can.
+    clauses.push(filters.hasImage ? "storage_key is not null" : "storage_key is null");
+  }
+
+  // No filters means no WHERE clause at all, not `where true`. Keep the SQL you
+  // send the same shape as the SQL you would have written by hand.
+  const sql = clauses.length === 0 ? "" : `where ${clauses.join(" and ")}`;
+  return { sql, params };
+}
+
+/**
+ * "Everything after this row", expressed so the index can seek to it.
+ *
+ * `(year, id) < ($1, $2)` is a ROW-VALUE comparison: it compares the pair
+ * lexicographically, which is precisely how a two-column index is ordered. That
+ * is why the plan shows it as an Index Cond rather than a Filter — the database
+ * seeks straight to the position instead of reading rows and discarding them.
+ *
+ * It is NOT equivalent to `year <= $1 and id < $2`, which drops every row that
+ * has a smaller year but a larger id. That version looks right, passes a casual
+ * test, and silently loses rows. Write the row comparison.
+ *
+ * Nulls are the hard part, and the reason keyset pagination has a reputation
+ * for being fiddly. A row comparison involving NULL evaluates to NULL, not
+ * true, so unrated drawings would vanish from every page after the first. Our
+ * ordering treats NULL as the smallest value (see buildOrderBy), so the null
+ * region sits at the end when descending and at the start when ascending, and
+ * the clause has to say which side of it we are on.
+ *
+ * This is a concrete argument for NOT NULL columns wherever the domain allows
+ * it. Here it doesn't — "unrated" is a real state — so we pay the complexity.
+ */
+function keysetClause({ sort, order, value, id }, params) {
+  const { column, nullable } = SORTS[sort];
+  const cmp = order === "desc" ? "<" : ">";
+
+  const bind = (v) => {
+    params.push(v);
+    return `$${params.length}`;
+  };
+
+  if (!nullable) {
+    return `(${column}, id) ${cmp} (${bind(value)}, ${bind(id)})`;
+  }
+
+  if (value === null) {
+    // The previous page ended inside the null region.
+    const i = bind(id);
+    return order === "desc"
+      // Descending: nulls are last, so nothing follows them but more nulls.
+      ? `(${column} is null and id < ${i})`
+      // Ascending: nulls are first, so the rest of the nulls come next, and
+      // then the entire non-null population.
+      : `((${column} is null and id > ${i}) or ${column} is not null)`;
+  }
+
+  const v = bind(value);
+  const i = bind(id);
+  return order === "desc"
+    // Descending: smaller values, then the null region we have not reached yet.
+    // Without `or ... is null` every unrated drawing disappears after page 1.
+    ? `((${column}, id) < (${v}, ${i}) or ${column} is null)`
+    // Ascending: the nulls came first and are already behind us.
+    : `(${column}, id) > (${v}, ${i})`;
+}
+
+/**
+ * Cursors are opaque strings, on purpose.
+ *
+ * base64 is NOT encryption and nothing here is secret — anyone can decode it,
+ * and that is fine, because it contains only values the caller can already see
+ * in the response. Opacity is a CONTRACT, not a security measure: it tells the
+ * client "do not construct or parse this", which leaves us free to change what
+ * is inside without breaking anyone. A cursor of `?after=1907` would become a
+ * public API the moment someone hand-wrote one.
+ *
+ * The cursor still arrives from the network, so it is untrusted like everything
+ * else. Decoding validates the shape and returns null on anything unexpected —
+ * base64 of arbitrary bytes, valid base64 of invalid JSON, valid JSON of the
+ * wrong shape. Every one of those is a 400, never a crash.
+ */
+function encodeCursor({ sort, order, value, id }) {
+  // base64url, not base64: the standard alphabet contains "+" and "/", which
+  // have meaning in a URL and would need escaping every time.
+  return Buffer.from(JSON.stringify({ s: sort, o: order, v: value, i: id })).toString("base64url");
+}
+
+function decodeCursor(raw) {
+  if (typeof raw !== "string" || raw.length === 0 || raw.length > 512) return null;
+  let parsed;
+  try {
+    parsed = JSON.parse(Buffer.from(raw, "base64url").toString("utf8"));
+  } catch {
+    return null;
+  }
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+
+  const { s: sort, o: order, v: value, i: id } = parsed;
+  if (typeof sort !== "string" || !Object.hasOwn(SORTS, sort)) return null;
+  if (typeof order !== "string" || !ORDERS.includes(order)) return null;
+  if (typeof id !== "string" || !UUID_RE.test(id)) return null;
+  // The sort value is a number, a string (numeric and timestamptz both arrive
+  // as strings from pg) or null for an unrated drawing. Nothing else.
+  if (value !== null && typeof value !== "number" && typeof value !== "string") return null;
+
+  return { sort, order, value, id };
+}
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
+/**
+ * Parse one query-string value that is supposed to be a number.
+ *
+ * A query string can only express STRINGS. `?year=1889` arrives as "1889" and
+ * there is no encoding in which it could arrive as the number 1889 — so unlike
+ * the JSON body, where we refuse to coerce "2026" and return a 400, here
+ * conversion is mandatory.
+ *
+ * That is not a contradiction. The rule was never "never coerce"; it is "know
+ * what your transport can express, and reject anything it can express that you
+ * did not mean". JSON has real types, so a string year is a client bug. A query
+ * string has no types, so a string year is the only thing possible.
+ *
+ * Number() rather than parseInt(), deliberately: parseInt("12abc") returns 12
+ * and parseInt("1e3") returns 1. The regex settles the shape first and Number
+ * then converts something already known to be a clean numeral.
+ */
+function parseNumber(raw, { integer }) {
+  if (typeof raw !== "string") return null;
+  const pattern = integer ? /^\d+$/ : /^\d+(\.\d+)?$/;
+  if (!pattern.test(raw)) return null;
+  const n = Number(raw);
+  return Number.isFinite(n) ? n : null;
+}
+
+/**
+ * Validate the query string.
+ *
+ * `?sort=year` looks like configuration rather than input because it sits in
+ * the URL bar, but it arrives from the same untrusted place as a JSON body: a
+ * caller we did not write. Same treatment.
+ *
+ * One trap specific to query strings. Express parses `?sort=year&sort=rating`
+ * into the ARRAY ["year", "rating"], not a string — a client can change the
+ * TYPE of a parameter just by repeating it. Every field below is therefore
+ * checked with typeof before anything else touches it. `req.query.sort
+ * .toLowerCase()` would crash on that input, and a crash driven by a URL a
+ * stranger chose is a denial of service, not a typo.
+ */
+function parseListQuery(q) {
+  const errors = [];
+
+  // Absent is not invalid — these are optional with documented defaults.
+  // Present-but-wrong IS invalid, and gets a 400 rather than a silent fallback
+  // to the default. Silently ignoring a parameter you don't understand means a
+  // client asking for `?sort=titel` gets a normal-looking response sorted by
+  // something else entirely, and nothing anywhere reports the typo.
+  const sort = q.sort === undefined ? DEFAULT_SORT : q.sort;
+  if (typeof sort !== "string" || !Object.hasOwn(SORTS, sort)) {
+    errors.push(`sort must be one of: ${Object.keys(SORTS).join(", ")}`);
+  }
+
+  const order = q.order === undefined ? DEFAULT_ORDER : q.order;
+  if (typeof order !== "string" || !ORDERS.includes(order)) {
+    errors.push(`order must be one of: ${ORDERS.join(", ")}`);
+  }
+
+  // --- filters, all optional -------------------------------------------
+  //
+  // `undefined` means "the caller did not filter on this" and is left out of
+  // the WHERE clause entirely. That is different from a value we rejected,
+  // which is an error — never a silently-dropped filter. A search that quietly
+  // ignores half your criteria and returns confident-looking results is worse
+  // than one that fails.
+  const filters = {};
+
+  if (q.year !== undefined) {
+    const year = parseNumber(q.year, { integer: true });
+    // Same bounds as the CHECK constraint in migrations/001. Not because the
+    // database would be harmed by year=99999 — no row can match it — but
+    // because a query outside the possible range is certainly a mistake, and
+    // saying so beats returning an empty list that looks like a real answer.
+    if (year === null || year < 1000 || year > 2100) {
+      errors.push("year must be an integer between 1000 and 2100");
+    } else {
+      filters.year = year;
+    }
+  }
+
+  if (q.minRating !== undefined) {
+    const minRating = parseNumber(q.minRating, { integer: false });
+    if (minRating === null || minRating < 0 || minRating > 5) {
+      errors.push("minRating must be a number between 0 and 5");
+    } else {
+      filters.minRating = minRating;
+    }
+  }
+
+  if (q.artist !== undefined) {
+    // Bounded on purpose. An unbounded search term is an unbounded pattern for
+    // the database to match against every row — the length limit is as much a
+    // resource control as a validation rule.
+    const artist = typeof q.artist === "string" ? q.artist.trim() : "";
+    if (artist.length < 1 || artist.length > 80) {
+      errors.push("artist must be 1-80 characters");
+    } else {
+      filters.artist = artist;
+    }
+  }
+
+  if (q.hasImage !== undefined) {
+    // "true"/"false" as strings, because a query string has no booleans. Note
+    // what is NOT used here: Boolean(q.hasImage), which returns true for the
+    // string "false" — one of the most reliable ways to ship a filter that
+    // does the opposite of what it says.
+    if (q.hasImage !== "true" && q.hasImage !== "false") {
+      errors.push('hasImage must be "true" or "false"');
+    } else {
+      filters.hasImage = q.hasImage === "true";
+    }
+  }
+
+  // --- paging ----------------------------------------------------------
+  let limit = DEFAULT_LIMIT;
+  if (q.limit !== undefined) {
+    const n = parseNumber(q.limit, { integer: true });
+    // Note that an over-large limit is an ERROR, not silently clamped to 100.
+    // Clamping would answer a different question than the one asked, and the
+    // caller would have no way to tell — they would page through 1,000,000
+    // records 100 at a time believing they had them all.
+    if (n === null || n < 1 || n > MAX_LIMIT) {
+      errors.push(`limit must be an integer between 1 and ${MAX_LIMIT}`);
+    } else {
+      limit = n;
+    }
+  }
+
+  let cursor = null;
+  if (q.cursor !== undefined) {
+    cursor = decodeCursor(q.cursor);
+    if (cursor === null) {
+      errors.push("cursor is not valid");
+    } else if (cursor.sort !== sort || cursor.order !== order) {
+      // A cursor means "after this row IN THIS ORDERING". Reusing it under a
+      // different sort is meaningless — the row it names isn't in that position
+      // any more — and would return a plausible-looking, wrong page. Changing
+      // the sort has to restart from the beginning, and saying so is kinder
+      // than silently obliging.
+      errors.push(`cursor was issued for sort=${cursor.sort}&order=${cursor.order}`);
+      cursor = null;
+    }
+  }
+
+  return { errors, value: { sort, order, filters, limit, cursor } };
+}
+
+// GET /api/drawings?sort=year&order=desc
 //
 // No try/catch. Express 5 detects that the handler returned a promise and
 // forwards a rejection to the error-handling middleware automatically. In
@@ -24,18 +404,64 @@ export const drawingsRouter = Router();
 // the browser just waited. Worth knowing, because most tutorials online still
 // wrap everything in try/catch for a version you are not running.
 drawingsRouter.get("/", async (req, res) => {
+  const parsed = parseListQuery(req.query);
+  if (parsed.errors.length > 0) {
+    return res.status(400).json({ error: "Invalid query", details: parsed.errors });
+  }
+  const { sort, order, filters, limit, cursor } = parsed.value;
+
+  const where = buildWhere(filters, cursor);
+
+  // Ask for one more row than we intend to return.
+  //
+  // That extra row answers "is there a next page?" for the price of reading one
+  // row. The obvious alternative — a second `select count(*)` — makes the
+  // database scan every matching row on every request just to produce a number
+  // the user rarely needs, and it is the reason so many admin dashboards are
+  // slow. If a total is genuinely required, that is a deliberate, separate,
+  // more expensive endpoint.
+  where.params.push(limit + 1);
+  const limitPlaceholder = `$${where.params.length}`;
+
   const { rows } = await query(
     `select id, title, artist, year, rating, created_at,
             storage_key, content_type, size_bytes
        from drawings
-      order by year desc, id desc`
+      ${where.sql}
+      ${buildOrderBy(sort, order)}
+      limit ${limitPlaceholder}`,
+    where.params
   );
 
-  // An object, not a bare array. A bare array is a dead end: the day you need
-  // to add a total count or a pagination cursor, there is nowhere to put it
-  // that isn't a breaking change for every existing client. Stage 3 will thank
-  // us for the envelope.
-  res.json({ drawings: rows.map(toApiShape) });
+  const hasMore = rows.length > limit;
+  const page = hasMore ? rows.slice(0, limit) : rows;
+
+  // The cursor is built from the LAST ROW WE ARE RETURNING, using the raw
+  // database value rather than the shape we send to the client. toApiShape
+  // converts rating to a number and created_at to a string for presentation;
+  // the cursor has to round-trip back into a WHERE clause, so it carries what
+  // Postgres gave us.
+  const last = page.at(-1);
+  const nextCursor =
+    hasMore && last !== undefined
+      ? encodeCursor({ sort, order, value: last[SORTS[sort].column], id: last.id })
+      : null;
+
+  // An object, not a bare array — and this is the stage where that pays off.
+  // Echoing back what was actually applied means a client never has to assume
+  // its request was honoured, and the cursor has somewhere to live. A bare
+  // array had nowhere to put any of this, and adding it later would have broken
+  // every existing caller.
+  res.json({
+    drawings: page.map(toApiShape),
+    sort,
+    order,
+    filters,
+    limit,
+    // null, not absent: "there is no next page" is a fact worth stating. An
+    // absent field is indistinguishable from a field the server forgot to send.
+    nextCursor,
+  });
 });
 
 // POST /api/drawings/upload-url

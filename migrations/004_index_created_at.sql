@@ -1,0 +1,30 @@
+-- Stage 3 offers `?sort=created_at`, and nothing indexes it for the general case.
+--
+-- migrations/003 created drawings_with_file_idx on (created_at desc, id desc),
+-- but it is a PARTIAL index — `where storage_key is not null`. A partial index
+-- can only be used when the query's own WHERE clause guarantees the index's
+-- predicate, because otherwise the planner cannot know the index contains every
+-- row the query needs. Measured on 5008 rows:
+--
+--   order by created_at desc, id desc              -> Seq Scan + top-N heapsort
+--   ... where storage_key is not null              -> Index Scan (partial index)
+--
+-- So the sort option we just exposed falls back to reading the whole table.
+-- Offering a sort is a promise; an index is how you keep it.
+--
+-- Both indexes are kept. The partial one is smaller and stays the better choice
+-- for the gallery's eventual main view (drawings that actually have an image),
+-- and the planner picks between them per query. The cost is write amplification
+-- on insert, which is the standing trade every index makes: reads get cheaper,
+-- writes get slightly more expensive, and storage grows.
+--
+-- Note the direction and the tiebreaker match buildOrderBy exactly. An index on
+-- (created_at) alone would not serve `created_at desc, id desc` as a seek, and
+-- keyset pagination's row-value comparison depends on that pairing.
+--
+-- CONCURRENTLY is deliberately NOT used here. It avoids locking writes on a busy
+-- table, but it cannot run inside a transaction — and our migration runner wraps
+-- each file in one, on purpose, so a half-applied migration is impossible. On a
+-- table this size the lock lasts milliseconds. On a large production table the
+-- calculation reverses, and the runner would need a way to opt out.
+create index drawings_created_at_idx on drawings (created_at desc, id desc);
