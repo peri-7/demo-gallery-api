@@ -15,7 +15,104 @@ import {
 // without touching a single route.
 export const drawingsRouter = Router();
 
-// GET /api/drawings
+// The sort allowlist.
+//
+// A column name is SYNTAX, not a value, so it can never be a bound parameter:
+// `order by $1` does not sort by the column you name — Postgres parses the
+// statement before the parameters arrive, sees a constant, and sorts by
+// nothing. Silently. No error, wrong answer.
+//
+// That rules out the defence we use everywhere else, so sorting needs a
+// different one. The client's string is never escaped, never sanitised, and
+// never concatenated into SQL. It is a KEY INTO THIS MAP. What reaches the
+// query is our value; theirs only ever chose between things we already wrote.
+//
+// `sort=year); drop table drawings--` is not dangerous here because it is not
+// dangerous anywhere: it simply isn't a key, and the request is a 400.
+const SORTS = {
+  // nullable matters for more than correctness — see buildOrderBy.
+  year: { column: "year", nullable: false },
+  rating: { column: "rating", nullable: true },
+  created_at: { column: "created_at", nullable: false },
+};
+
+const ORDERS = ["asc", "desc"];
+
+const DEFAULT_SORT = "year";
+const DEFAULT_ORDER = "desc";
+
+/**
+ * Build the ORDER BY clause from an already-validated sort key.
+ *
+ * Every fragment here comes from SORTS or from a two-element literal list. No
+ * caller-supplied character reaches the SQL string. That is the only reason a
+ * template literal is acceptable in a query at all, and it is worth being
+ * suspicious of every other one you ever see.
+ */
+function buildOrderBy(sort, order) {
+  const { column, nullable } = SORTS[sort];
+
+  // The tiebreaker follows the same direction as the main key. Without `id`,
+  // rows sharing a year have NO defined order — two identical requests may
+  // return them differently, and pagination built on that is broken from the
+  // start. See the index in migrations/001, which was created with this in mind.
+  const tiebreak = `id ${order}`;
+
+  if (!nullable) return `order by ${column} ${order}, ${tiebreak}`;
+
+  // Nulls need an explicit position, for two separate reasons.
+  //
+  // MEANING: Postgres's default is nulls-first when descending and nulls-last
+  // when ascending — i.e. NULL is treated as the LARGEST value. For a rating,
+  // that puts every unrated drawing above the 5-star ones. We want the
+  // opposite: unrated sorts below everything.
+  //
+  // PERFORMANCE: an index records a null position too. migrations/001 created
+  // (rating desc nulls last, id desc). A query asking for `nulls first` cannot
+  // use it, and a query asking for ascending order uses it by scanning
+  // BACKWARDS — which yields `rating asc nulls first`. So the clause below is
+  // not just our preferred meaning, it is the one shape that stays indexed in
+  // both directions. Sort order and index definition are one decision, not two.
+  const nulls = order === "desc" ? "nulls last" : "nulls first";
+  return `order by ${column} ${order} ${nulls}, ${tiebreak}`;
+}
+
+/**
+ * Validate the query string.
+ *
+ * `?sort=year` looks like configuration rather than input because it sits in
+ * the URL bar, but it arrives from the same untrusted place as a JSON body: a
+ * caller we did not write. Same treatment.
+ *
+ * One trap specific to query strings. Express parses `?sort=year&sort=rating`
+ * into the ARRAY ["year", "rating"], not a string — a client can change the
+ * TYPE of a parameter just by repeating it. Every field below is therefore
+ * checked with typeof before anything else touches it. `req.query.sort
+ * .toLowerCase()` would crash on that input, and a crash driven by a URL a
+ * stranger chose is a denial of service, not a typo.
+ */
+function parseListQuery(q) {
+  const errors = [];
+
+  // Absent is not invalid — these are optional with documented defaults.
+  // Present-but-wrong IS invalid, and gets a 400 rather than a silent fallback
+  // to the default. Silently ignoring a parameter you don't understand means a
+  // client asking for `?sort=titel` gets a normal-looking response sorted by
+  // something else entirely, and nothing anywhere reports the typo.
+  const sort = q.sort === undefined ? DEFAULT_SORT : q.sort;
+  if (typeof sort !== "string" || !Object.hasOwn(SORTS, sort)) {
+    errors.push(`sort must be one of: ${Object.keys(SORTS).join(", ")}`);
+  }
+
+  const order = q.order === undefined ? DEFAULT_ORDER : q.order;
+  if (typeof order !== "string" || !ORDERS.includes(order)) {
+    errors.push(`order must be one of: ${ORDERS.join(", ")}`);
+  }
+
+  return { errors, value: { sort, order } };
+}
+
+// GET /api/drawings?sort=year&order=desc
 //
 // No try/catch. Express 5 detects that the handler returned a promise and
 // forwards a rejection to the error-handling middleware automatically. In
@@ -24,18 +121,25 @@ export const drawingsRouter = Router();
 // the browser just waited. Worth knowing, because most tutorials online still
 // wrap everything in try/catch for a version you are not running.
 drawingsRouter.get("/", async (req, res) => {
+  const parsed = parseListQuery(req.query);
+  if (parsed.errors.length > 0) {
+    return res.status(400).json({ error: "Invalid query", details: parsed.errors });
+  }
+  const { sort, order } = parsed.value;
+
   const { rows } = await query(
     `select id, title, artist, year, rating, created_at,
             storage_key, content_type, size_bytes
        from drawings
-      order by year desc, id desc`
+      ${buildOrderBy(sort, order)}`
   );
 
-  // An object, not a bare array. A bare array is a dead end: the day you need
-  // to add a total count or a pagination cursor, there is nowhere to put it
-  // that isn't a breaking change for every existing client. Stage 3 will thank
-  // us for the envelope.
-  res.json({ drawings: rows.map(toApiShape) });
+  // An object, not a bare array — and this is the stage where that pays off.
+  // Echoing the applied sort back means a client never has to assume its
+  // request was honoured, and a total count or a cursor can be added later
+  // without breaking a single existing caller. A bare array had nowhere to put
+  // any of this.
+  res.json({ drawings: rows.map(toApiShape), sort, order });
 });
 
 // POST /api/drawings/upload-url
