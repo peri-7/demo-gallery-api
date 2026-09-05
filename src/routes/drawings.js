@@ -1,5 +1,6 @@
 import { Router } from "express";
 import { query } from "../db.js";
+import { requireAuth } from "../auth.js";
 import {
   ALLOWED_CONTENT_TYPES,
   MAX_UPLOAD_BYTES,
@@ -472,7 +473,19 @@ drawingsRouter.get("/", async (req, res) => {
 // Note what this endpoint does NOT do: talk to storage, or touch the database.
 // Signing is local computation, and nothing is recorded yet because nothing has
 // happened yet. A signed URL that is never used costs exactly nothing.
-drawingsRouter.post("/upload-url", async (req, res) => {
+//
+// requireAuth goes HERE, on the first step, not only on the last one.
+//
+// It would be tempting to guard only POST / — that is where a row appears, so
+// that is where the damage is. But this endpoint hands out a SIGNED URL: a
+// capability to write bytes into our bucket, valid for its lifetime, usable by
+// anyone holding it and answerable to no further check. Leaving it open means
+// anonymous strangers can fill the bucket with whatever they like, and the
+// insert they never perform is not the part that costs money.
+//
+// The rule: authorize where the CAPABILITY is granted, not where the record is
+// written.
+drawingsRouter.post("/upload-url", requireAuth, async (req, res) => {
   const { contentType } = req.body ?? {};
 
   if (!ALLOWED_CONTENT_TYPES.includes(contentType)) {
@@ -500,7 +513,13 @@ drawingsRouter.post("/upload-url", async (req, res) => {
 // before any row exists. If this handler fails, the worst outcome is an object
 // nobody references — invisible and cheap. The reverse order would risk a row
 // pointing at nothing, which is a broken image in front of a user.
-drawingsRouter.post("/", async (req, res) => {
+//
+// Also guarded, and not redundantly: an attacker who obtained a signed URL
+// earlier (from a leaked log, or from a session since revoked) could still PUT
+// bytes with it until it expires. Requiring a live session again here means the
+// row — the part visitors actually see — cannot be created by someone who is no
+// longer allowed in. Two gates on two different questions.
+drawingsRouter.post("/", requireAuth, async (req, res) => {
   const parsed = parseDrawingInput(req.body ?? {});
   if (parsed.errors.length > 0) {
     return res.status(400).json({ error: "Invalid drawing", details: parsed.errors });

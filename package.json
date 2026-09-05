@@ -12,7 +12,10 @@
     "migrate": "node --env-file=.env src/migrate.js",
     "migrate:prod": "node --env-file=.env.production src/migrate.js",
     "check:storage": "node --env-file=.env scripts/check-storage.mjs",
-    "check:api": "node scripts/check-api.mjs"
+    "check:api": "node scripts/check-api.mjs",
+    "check:password": "node scripts/check-password.mjs",
+    "check:sessions": "node --env-file=.env scripts/check-sessions.mjs",
+    "check:auth": "node scripts/check-auth.mjs"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.1125.0",
