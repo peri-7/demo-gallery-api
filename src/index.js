@@ -2,6 +2,7 @@ import express from "express";
 import { cors } from "./cors.js";
 import { pool } from "./db.js";
 import { drawingsRouter } from "./routes/drawings.js";
+import { authRouter } from "./routes/auth.js";
 
 const app = express();
 
@@ -66,6 +67,12 @@ app.get("/api/hello", (req, res) => {
 // Mount the router under its prefix. Every path inside drawings.js is relative
 // to this string, and this is the only place it appears.
 app.use("/api/drawings", drawingsRouter);
+
+// Authentication. Mounted AFTER express.json() above, because every endpoint in
+// it reads req.body — middleware order is execution order, and a router mounted
+// before the body parser receives req.body === undefined with no error at all
+// (QUIZ.md E3).
+app.use("/api/auth", authRouter);
 
 // 404: reached only if no route above matched.
 app.use((req, res) => {
