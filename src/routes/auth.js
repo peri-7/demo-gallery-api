@@ -24,7 +24,8 @@ import {
   needsRehash,
 } from "../password.js";
 import { createSession, destroySession } from "../sessions.js";
-import { requireAuth, bearerToken } from "../auth.js";
+import { requireAuth, sessionToken } from "../auth.js";
+import { setSessionCookie, clearSessionCookie } from "../cookies.js";
 
 export const authRouter = Router();
 
@@ -234,12 +235,21 @@ authRouter.post("/login", async (req, res) => {
   // device" is only meaningful if devices have separate rows.
   const session = await createSession(user.id);
 
+  // Stage 4b: the token leaves in a Set-Cookie header instead of the body.
+  setSessionCookie(res, session.token, session.expiresAt);
+
   res.json({
-    // The token, in the response body, exactly once. This is the crude version:
-    // it works, it is testable with curl, and it says nothing about where the
-    // client should PUT it — which is the entire subject of Stage 4b, and a
-    // genuinely hard question with several defensible answers.
-    token: session.token,
+    // NOTE WHAT IS NO LONGER HERE: `token`.
+    //
+    // Returning it as well would quietly defeat the entire point of HttpOnly.
+    // The cookie is unreadable to page JavaScript — but a token in the response
+    // body is readable by whatever called fetch(), so any XSS payload that can
+    // trigger a login response can read it, and any client that receives it is
+    // tempted to stash it somewhere attackable. A credential the browser
+    // manages must not also be handed to the code we were protecting it from.
+    //
+    // Non-browser clients are unaffected: curl reads Set-Cookie like any other
+    // header (`curl -c jar`), and scripts/ now does exactly that.
     expiresAt: session.expiresAt,
     user: { id: user.id, email: user.email },
   });
@@ -254,7 +264,16 @@ authRouter.post("/logout", async (req, res) => {
   // caller must already possess the token for, so demanding a valid session
   // first only means an expired token produces a 401 instead of doing the
   // obvious thing.
-  await destroySession(bearerToken(req));
+  await destroySession(sessionToken(req));
+
+  // Clear the cookie too. The DELETE above is what actually ends the session —
+  // the row is the authority, exactly as in Stage 4a — but leaving the cookie in
+  // place would mean the browser keeps sending a string that names nothing, and
+  // every subsequent request pays a pointless database lookup to be told 401.
+  //
+  // The attributes must match the ones it was set with or the browser treats it
+  // as a different cookie and leaves the original alone. See cookies.js.
+  clearSessionCookie(res);
 
   // 204 unconditionally, whether a row was deleted or not. There is nothing
   // for a client to do differently, and reporting the difference would confirm
