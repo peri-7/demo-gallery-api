@@ -9,7 +9,7 @@
 
 // Comma-separated allowlist, e.g.
 //   CORS_ORIGINS=http://localhost:5173,https://demo-gallery.vercel.app
-const allowed = (process.env.CORS_ORIGINS ?? "")
+export const allowedOrigins = (process.env.CORS_ORIGINS ?? "")
   .split(",")
   .map((o) => o.trim())
   .filter(Boolean);
@@ -27,7 +27,7 @@ export function cors(req, res, next) {
   // check, same-origin navigation). Nothing to negotiate.
   if (!origin) return next();
 
-  if (allowed.includes(origin)) {
+  if (allowedOrigins.includes(origin)) {
     // Echo the exact origin back. Not "*" — a wildcard is incompatible with
     // credentials, and echoing is what lets us support several origins.
     res.setHeader("Access-Control-Allow-Origin", origin);
