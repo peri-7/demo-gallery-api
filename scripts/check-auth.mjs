@@ -12,14 +12,25 @@
 
 const API = process.env.API_URL ?? "http://localhost:3000";
 
+// Must be one of the server's CORS_ORIGINS, or the CSRF check below refuses it —
+// which is the point. Override when running against production:
+//   API_URL=https://… CHECK_ORIGIN=https://… npm run check:auth
+const allowedOrigin = process.env.CHECK_ORIGIN ?? "http://localhost:5173";
+
 const email = `check-auth-${Date.now()}@example.invalid`;
 const password = "a perfectly reasonable password";
 
-async function call(method, path, { body, token, rawAuth } = {}) {
+async function call(method, path, { body, token, rawAuth, cookie, origin } = {}) {
   const headers = {};
   if (body !== undefined) headers["Content-Type"] = "application/json";
   if (token) headers.Authorization = `Bearer ${token}`;
   if (rawAuth) headers.Authorization = rawAuth; // send a header verbatim, valid or not
+  if (cookie) headers.Cookie = `session=${cookie}`;
+  // Origin is a FORBIDDEN HEADER NAME in a browser — page JavaScript cannot set
+  // it, which is exactly why the server can trust it. We are not a browser, so
+  // we can claim any origin we like. That asymmetry is the whole reason this
+  // script can impersonate an attacker and a real client cannot lie.
+  if (origin) headers.Origin = origin;
 
   const started = Date.now();
   const res = await fetch(`${API}${path}`, {
@@ -37,6 +48,26 @@ async function call(method, path, { body, token, rawAuth } = {}) {
     parsed = text;
   }
   return { status: res.status, ms, body: parsed, headers: res.headers };
+}
+
+/**
+ * Pull the session token out of Set-Cookie.
+ *
+ * Stage 4b: the token no longer comes back in the response body, because a body
+ * is readable by page JavaScript and the entire point of HttpOnly is that the
+ * credential is not. It arrives in a Set-Cookie header instead.
+ *
+ * A browser would store this automatically and never show it to anyone. We are
+ * not a browser, so we read the header like any other — which is exactly how a
+ * mobile app or a server-side client participates in a cookie flow.
+ */
+function sessionCookie(headers) {
+  const all = headers.getSetCookie?.() ?? [headers.get("set-cookie") ?? ""];
+  for (const line of all) {
+    const m = /^session=([^;]*)/.exec(line.trim());
+    if (m && m[1] !== "") return decodeURIComponent(m[1]);
+  }
+  return null;
 }
 
 function show(label, r, extra = "") {
@@ -63,8 +94,10 @@ show("no such account", await call("POST", "/api/auth/login", { body: { email: "
 // --- login success ----------------------------------------------------------
 console.log("\nlogin:");
 const login = await call("POST", "/api/auth/login", { body: { email, password } });
-show("correct credentials", { ...login, body: { ...login.body, token: `${login.body.token.slice(0, 12)}…` } });
-const token = login.body.token;
+show("correct credentials", login);
+const token = sessionCookie(login.headers);
+console.log(`  ${"note: no token in the body".padEnd(46)}      Set-Cookie: session=${token?.slice(0, 12)}…`);
+console.log(`  ${"".padEnd(46)}      ${login.headers.get("set-cookie")?.replace(/session=[^;]*/, "session=…")}`);
 
 // --- case and whitespace ----------------------------------------------------
 const messy = await call("POST", "/api/auth/login", {
@@ -92,6 +125,36 @@ const signed = await call("POST", "/api/drawings/upload-url", {
 show("POST /api/drawings/upload-url  logged in", { ...signed, body: { key: signed.body.key } });
 show("POST /api/drawings              anonymous",
   await call("POST", "/api/drawings", { body: { title: "x", artist: "y", year: 1900 } }));
+
+// --- Stage 4b: the cookie transport, and the CSRF defence it needs -----------
+//
+// The same session, presented three ways. Only the transport differs — the
+// sessions table, the sha256 lookup and requireAuth are identical in all three.
+console.log("\nsame session, three transports:");
+show("Authorization: Bearer <token>", await call("GET", "/api/auth/me", { token }));
+show("Cookie: session=<token>", await call("GET", "/api/auth/me", { cookie: token }));
+show("both at once (cookie wins)", await call("GET", "/api/auth/me", { cookie: token, token: "garbage" }));
+
+// This is the attack cookies re-open, and it is worth seeing that the session is
+// entirely VALID — nothing was stolen or forged. The request is refused purely
+// because of where the browser says it came from.
+console.log("\nCSRF — a valid cookie is not enough:");
+// A signed URL is a write capability for anyone holding it, so print only the
+// key — never the signed URL itself. Same reason the check scripts never print
+// DATABASE_URL: a short lifetime is not the same thing as not being a secret.
+const csrfCase = async (label, opts) => {
+  const r = await call("POST", "/api/drawings/upload-url", {
+    body: { contentType: "image/png" },
+    cookie: token,
+    ...opts,
+  });
+  show(label, { ...r, body: r.body?.key ? { key: r.body.key } : r.body });
+};
+await csrfCase("POST from our own origin", { origin: allowedOrigin });
+await csrfCase("POST from https://evil.example", { origin: "https://evil.example" });
+await csrfCase("POST with no Origin (curl, mobile)", {});
+show("GET from https://evil.example (safe method)",
+  { ...(await call("GET", "/api/drawings?limit=1", { origin: "https://evil.example" })), body: "(allowed — but evil.example cannot READ it: no Allow-Origin came back)" });
 
 console.log("\nreads stay public:");
 const list = await call("GET", "/api/drawings?limit=1");

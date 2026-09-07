@@ -1,5 +1,6 @@
 import express from "express";
 import { cors } from "./cors.js";
+import { csrf } from "./csrf.js";
 import { pool } from "./db.js";
 import { drawingsRouter } from "./routes/drawings.js";
 import { authRouter } from "./routes/auth.js";
@@ -23,6 +24,17 @@ app.use((req, res, next) => {
 // Before the routes: a preflight must be answered here, not fall through to a
 // handler that has no idea what OPTIONS means.
 app.use(cors);
+
+// CSRF, immediately after CORS and before anything that can change state.
+//
+// Order matters twice here. It must come AFTER cors, so a preflight is already
+// answered and never reaches it. And it must come before the routes, because a
+// rule that only some handlers remember to apply is a rule that the next
+// endpoint will forget — the same argument that made requireAuth middleware.
+//
+// It needs no request body, so it does not matter that express.json() has not
+// run yet: the decision is made entirely from the Origin header.
+app.use(csrf);
 
 // Parses JSON request bodies into req.body. Without it, req.body is undefined
 // and no error is thrown — see QUIZ.md E3.

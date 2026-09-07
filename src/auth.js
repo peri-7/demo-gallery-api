@@ -7,15 +7,20 @@
  * identical for every protected route, and a rule written once in one place
  * cannot be forgotten on the fourth endpoint someone adds next year.
  *
- * WHERE THE TOKEN COMES FROM IS NOT DECIDED HERE — that is Stage 4b's whole
- * subject. For now it arrives in an `Authorization: Bearer` header, because
- * that is the form curl can produce with no browser involved, which keeps 4a
- * testable without touching a single cross-origin question. Note that
- * bearerToken() is the ONLY function that knows this. Swapping to a cookie in
- * 4b, or supporting both, means editing that one function.
+ * WHERE THE TOKEN COMES FROM IS DECIDED HERE, AND ONLY HERE.
+ *
+ * Stage 4a said this was the seam Stage 4b would move, and this is the move.
+ * Everything downstream — findSession, requireAuth, the route guards, the
+ * sessions table, the sha256 lookup — is unchanged and indifferent. The token
+ * is the same 43-character string it always was. Only its transport changed.
+ *
+ * That is worth noticing as a design result, not a coincidence: the reason this
+ * stage is a two-function edit rather than a rewrite is that 4a refused to let
+ * knowledge of HTTP leak into sessions.js.
  */
 
 import { findSession } from "./sessions.js";
+import { parseCookies, SESSION_COOKIE } from "./cookies.js";
 
 /**
  * Pull the token out of `Authorization: Bearer <token>`.
@@ -36,12 +41,47 @@ export function bearerToken(req) {
 }
 
 /**
+ * Pull the token out of the session cookie.
+ */
+export function cookieToken(req) {
+  const value = parseCookies(req)[SESSION_COOKIE];
+  return typeof value === "string" && value !== "" ? value : null;
+}
+
+/**
+ * The one place that decides how a session is presented.
+ *
+ * COOKIE FIRST, THEN Authorization. Two questions worth answering about that:
+ *
+ * WHY SUPPORT BOTH? The cookie is for browsers, where HttpOnly is the point.
+ * The header is for everything that has no cookie jar — curl, our own check
+ * scripts, a future mobile app. Dropping it would mean every script in
+ * scripts/ has to manage a cookie file to test an endpoint.
+ *
+ * DOES ACCEPTING BOTH WEAKEN ANYTHING? No, and the reason is precise: CSRF
+ * works because the browser attaches the cookie AUTOMATICALLY. There is no
+ * equivalent for Authorization — an attacker's page cannot make the browser add
+ * a header it did not write, and writing it requires a preflight our allowlist
+ * refuses. So the header path adds no ambient authority. The cookie is the only
+ * risky transport, and csrf.js covers it.
+ *
+ * The ORDER matters though. Preferring the cookie means a browser session
+ * cannot be silently overridden by an attacker-supplied Authorization header on
+ * a request our own page made — a narrow case, but the cheap choice is the safe
+ * one, and "whichever we found first" is not a decision anyone should have to
+ * reconstruct later.
+ */
+export function sessionToken(req) {
+  return cookieToken(req) ?? bearerToken(req);
+}
+
+/**
  * Attach req.auth if a valid session was presented; otherwise leave it null.
  * Never rejects. For endpoints that behave differently for a logged-in user but
  * remain open to everyone — the gallery listing, eventually.
  */
 export async function attachUser(req, res, next) {
-  req.auth = await findSession(bearerToken(req));
+  req.auth = await findSession(sessionToken(req));
   next();
 }
 
@@ -55,7 +95,7 @@ export async function attachUser(req, res, next) {
  * error.
  */
 export async function requireAuth(req, res, next) {
-  const token = bearerToken(req);
+  const token = sessionToken(req);
   const auth = token === null ? null : await findSession(token);
 
   if (auth === null) {
