@@ -57,6 +57,7 @@
  */
 
 import { allowedOrigins } from "./cors.js";
+import { logger } from "./logger.js";
 
 // GET and HEAD are supposed to be SAFE — no side effects — so there is nothing
 // for a forged one to accomplish. That guarantee is ours to keep: it is exactly
@@ -90,7 +91,16 @@ export function csrf(req, res, next) {
     // The user here may be perfectly well authenticated. The request is refused
     // because of WHERE IT CAME FROM, and logging in again would change nothing.
     // Answering 401 would send the client off to a login form in a loop.
-    console.warn(`CSRF: refused ${req.method} ${req.originalUrl} from origin=${origin}`);
+    // req.log ?? logger: the request logger is attached by the first
+    // middleware in index.js, so it is always there — unless someone reorders
+    // the chain. Falling back keeps a LOGGING concern from ever turning a 403
+    // into a 500. Same principle as exempting /health from rate limiting: a
+    // diagnostic must never be capable of breaking the thing it observes.
+    (req.log ?? logger).warn("csrf refused", {
+      method: req.method,
+      path: req.originalUrl,
+      origin,
+    });
     return res.status(403).json({ error: "Cross-site request refused" });
   }
 

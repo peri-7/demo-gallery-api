@@ -6,6 +6,7 @@
 // every request until the process dies. See THEORY.md §10.
 
 import pg from "pg";
+import { logger } from "./logger.js";
 
 // `pg` is a CommonJS package. Node can usually synthesise named exports from
 // one, but it does it by static analysis and it is not guaranteed. Importing
@@ -55,7 +56,15 @@ export const pool = new Pool({
 // The pool discards the broken connection and opens a fresh one on next use,
 // so logging is genuinely the right response.
 pool.on("error", (err) => {
-  console.error("Idle database client errored:", err.message);
+  // The base logger, with no reqId — correctly so, and worth noticing. This
+  // fires on a connection sitting IDLE, so there is no request to attribute it
+  // to. A line with no reqId is a real signal here: it means "this happened to
+  // the server, not to somebody".
+  //
+  // Passing the whole error rather than err.message: the logger redacts
+  // connection strings by value, so a Postgres error that quotes the DSN
+  // cannot leak the password through a field nobody thought to check.
+  logger.error("idle database client errored", { err });
 });
 
 /**

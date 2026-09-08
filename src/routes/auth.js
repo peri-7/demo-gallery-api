@@ -258,7 +258,12 @@ authRouter.post("/login", limitAuthByIp, async (req, res) => {
     // logs are read by more people and kept longer than the database, and
     // "which addresses are under attack" is exactly the list an attacker wants.
     // The IP is what an operator actually needs to act on.
-    console.warn(`RATE LIMIT login-failures: refused login ip=${req.ip} retryAfter=${retryAfter}s`);
+    req.log.warn("rate limit refused", {
+      limiter: loginFailureLimit.name,
+      path: req.originalUrl,
+      ip: req.ip,
+      retryAfterSeconds: retryAfter,
+    });
     return res.status(429).json({
       error: "Too many failed sign-in attempts. Try again later.",
       retryAfterSeconds: retryAfter,

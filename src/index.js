@@ -1,4 +1,6 @@
 import express from "express";
+import { randomBytes } from "node:crypto";
+import { logger, logConfig } from "./logger.js";
 import { cors } from "./cors.js";
 import { csrf } from "./csrf.js";
 import { SlidingWindow, rateLimit } from "./ratelimit.js";
@@ -39,23 +41,55 @@ if (Number.isNaN(trustProxyHops) || trustProxyHops < 0) {
 // default: req.ip is then the socket peer and X-Forwarded-For is ignored.
 app.set("trust proxy", trustProxyHops);
 
-// Request log. Runs on every request because it has no path argument.
-// res.on("finish") fires once the response has been handed to the socket, so
-// we can log the status we actually sent.
-//
-// ip and xff are both here deliberately, and they are how you configure the
-// setting above: send one real request to production and compare them. If
-// xff has two entries and ip is the rightmost, TRUST_PROXY_HOPS is wrong.
+/**
+ * Give every request an id, and a logger that carries it.
+ *
+ * FIRST in the chain, before anything that can refuse a request, so that a 429
+ * or a CSRF 403 is logged with an id like everything else. A middleware that
+ * only identifies the requests which succeed is useless precisely when you
+ * need it.
+ *
+ * The id is GENERATED, never taken from an incoming X-Request-Id header. Real
+ * distributed systems do accept one, to trace a request across services — but
+ * an inbound value is client-controlled text, and text that goes straight into
+ * a log file is a log-injection primitive: a newline in the "id" lets a caller
+ * forge entire log lines. We have no upstream service issuing ids, so
+ * accepting one would be all risk and no benefit. If it were ever needed, the
+ * rule is the Stage 3 cursor rule again — revalidate on the way in.
+ */
 app.use((req, res, next) => {
+  const reqId = randomBytes(8).toString("hex");
+  req.log = logger.child({ reqId });
+
+  // Returned so a human can quote an exact id instead of describing what they
+  // did. Turns "it broke around 3pm" into one line of the log.
+  res.setHeader("X-Request-Id", reqId);
+
   const started = Date.now();
+
+  // "finish" fires once the response has been handed to the socket, which is
+  // the only moment we know the status we actually sent.
   res.on("finish", () => {
-    console.log(
-      `${req.method} ${req.originalUrl} ${res.statusCode} ${Date.now() - started}ms` +
-        ` origin=${req.headers.origin ?? "-"}` +
-        ` ip=${req.ip ?? "-"}` +
-        ` xff=${req.headers["x-forwarded-for"] ?? "-"}`
-    );
+    // Health probes drop to debug. Render polls /health constantly, and those
+    // lines bury everything a human wants to see — which is exactly how the
+    // first log line we went looking for turned out to be a health check.
+    // Noise is not free: a log nobody can read is a log nobody reads.
+    const level = req.path.startsWith("/health") ? "debug" : "info";
+
+    req.log[level]("request", {
+      method: req.method,
+      path: req.originalUrl,
+      status: res.statusCode,
+      ms: Date.now() - started,
+      origin: req.headers.origin,
+      // ip and xff stay, and they are how TRUST_PROXY_HOPS gets configured:
+      // send one real request and check that ip is the client rather than a
+      // proxy. As fields now, so they can be filtered rather than eyeballed.
+      ip: req.ip,
+      xff: req.headers["x-forwarded-for"],
+    });
   });
+
   next();
 });
 
@@ -134,7 +168,9 @@ app.get("/health/db", async (req, res) => {
       pool: { total: pool.totalCount, idle: pool.idleCount, waiting: pool.waitingCount },
     });
   } catch (err) {
-    console.error("Readiness check failed:", err.message);
+    // req.log, not the base logger: this line now carries the reqId, so it can
+    // be tied to the exact probe that failed rather than floating alone.
+    req.log.error("readiness check failed", { err });
     res.status(503).json({ status: "unavailable" });
   }
 });
@@ -164,12 +200,31 @@ app.use((req, res) => {
 // Error handler: four arguments is how Express tells it apart from ordinary
 // middleware. Never leak err.message to the client — see QUIZ.md E14.
 app.use((err, req, res, next) => {
-  console.error(err);
+  // The logger serialises Error objects properly. Worth knowing why that needs
+  // saying: JSON.stringify(new Error("boom")) is "{}", because message, name
+  // and stack are all non-enumerable. Logging an error naively into a
+  // structured logger is the classic way to produce a line that says nothing.
+  req.log.error("unhandled error", { err, method: req.method, path: req.originalUrl });
+
+  // Still no err.message to the client — see QUIZ.md E14. But now the response
+  // carries X-Request-Id, so a user CAN quote the id and we can find the exact
+  // stack trace. That is the honest version of "something went wrong": opaque
+  // to a stranger, precisely locatable by us.
   res.status(500).json({ error: "Internal server error" });
 });
 
 const port = process.env.PORT || 3000;
 
 app.listen(port, () => {
-  console.log(`API listening on http://localhost:${port}`);
+  logger.info("api listening", {
+    port,
+    // Report the logging configuration at boot. If someone deploys with
+    // LOG_LEVEL=debug and forgets, this is the line that says so — a control
+    // that silently stays on is the same class of problem as one that silently
+    // switches off.
+    logLevel: logConfig.level,
+    logFormat: logConfig.format,
+    trustProxyHops,
+    nodeEnv: process.env.NODE_ENV ?? "development",
+  });
 });
