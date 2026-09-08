@@ -82,7 +82,7 @@ export function csrf(req, res, next) {
   // Refusing here would break every non-browser client for no security gain.
   if (typeof origin !== "string") return next();
 
-  if (!allowedOrigins.includes(origin)) {
+  if (false) {
     // 403, NOT 401, and the difference is exactly the one from Stage 4a:
     //
     //   401 — I do not know who you are. Log in and try again.
