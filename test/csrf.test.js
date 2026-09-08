@@ -1,0 +1,131 @@
+/**
+ * The CSRF middleware.
+ *
+ * WHY THIS FILE IS THE POINT OF THE STAGE
+ * ---------------------------------------
+ * Right now the CSRF defence is a small function nobody has any reason to
+ * notice. Delete the `allowedOrigins.includes` check and every test we have
+ * still passes, every check script still prints happily, and the app works
+ * perfectly — for us and for an attacker.
+ *
+ * QUIZ J9: a defence you get by accident is not one you can rely on, because
+ * nobody knows they are removing it. These tests are how "we happen to refuse
+ * cross-site POSTs" becomes "deleting this makes the build red".
+ *
+ * Note what is tested: not the happy path alone, but the three decisions that
+ * look wrong until you know why. Those are the ones a future reader is most
+ * likely to "fix".
+ */
+
+import { test, describe } from "node:test";
+import assert from "node:assert/strict";
+
+/**
+ * THE ENV MUST BE SET BEFORE THE MODULE IS IMPORTED, HENCE THE DYNAMIC IMPORT.
+ *
+ * cors.js reads CORS_ORIGINS at module scope — once, when it is first
+ * evaluated — and csrf.js shares that allowlist. A static `import` is hoisted
+ * and runs before any code in this file, so setting process.env afterwards
+ * would be too late: the allowlist would already be [] and every "allowed
+ * origin" assertion would fail for a reason that has nothing to do with CSRF.
+ *
+ * The first version of this file did exactly that and failed. Worth keeping,
+ * because it is the same lesson as QUIZ G1 (the API URL baked into the
+ * frontend at build time) arriving from a different direction: CONFIGURATION
+ * IS READ AT A PARTICULAR MOMENT, and if you are late, you get the default.
+ *
+ * node --test runs each test file in its own process, so this cannot leak into
+ * another file's expectations.
+ */
+const ALLOWED = "https://client.example";
+process.env.CORS_ORIGINS = `${ALLOWED},https://other.example`;
+const { csrf } = await import("../src/csrf.js");
+
+// The smallest req/res that satisfies the middleware. No Express, no server,
+// no port — this is why these tests run in milliseconds and need no secrets.
+function run({ method = "POST", origin, url = "/api/drawings" } = {}) {
+  const req = {
+    method,
+    originalUrl: url,
+    headers: origin === undefined ? {} : { origin },
+    log: { warn() {} }, // the middleware logs a refusal; swallow it
+  };
+
+  const result = { status: null, body: null, nextCalled: false };
+  const res = {
+    status(code) {
+      result.status = code;
+      return res;
+    },
+    json(payload) {
+      result.body = payload;
+      return res;
+    },
+  };
+
+  csrf(req, res, () => {
+    result.nextCalled = true;
+  });
+  return result;
+}
+
+describe("state-changing requests", () => {
+  test("allows a POST from an allowed origin", () => {
+    const r = run({ origin: ALLOWED });
+    assert.equal(r.nextCalled, true);
+    assert.equal(r.status, null);
+  });
+
+  test("refuses a POST from an unlisted origin", () => {
+    const r = run({ origin: "https://evil.example" });
+    assert.equal(r.nextCalled, false);
+    assert.equal(r.status, 403);
+  });
+
+  test("refuses with 403, not 401", () => {
+    // The distinction is behavioural, not cosmetic. The user may be perfectly
+    // authenticated — the refusal is about WHERE the request came from. A 401
+    // tells the client to show a login form; the user logs in successfully;
+    // the next request fails identically. That is a loop, not an error.
+    const r = run({ origin: "https://evil.example" });
+    assert.equal(r.status, 403);
+    assert.notEqual(r.status, 401);
+  });
+
+  test("an origin that merely starts with an allowed one is refused", () => {
+    // Guards against someone "simplifying" the check to startsWith or a
+    // substring match. https://localhost:5173.evil.example is a domain the
+    // attacker owns.
+    const r = run({ origin: `${ALLOWED}.evil.example` });
+    assert.equal(r.status, 403);
+  });
+});
+
+describe("the decisions that look like bugs", () => {
+  test("allows GET from anywhere — safe methods are exempt", () => {
+    // A guarantee we must keep, and the reason logout is a POST. If GET were
+    // ever state-changing, an <img src> could trigger it.
+    const r = run({ method: "GET", origin: "https://evil.example" });
+    assert.equal(r.nextCalled, true);
+  });
+
+  test("allows a request with NO Origin header", () => {
+    // Not a hole, and the most counter-intuitive line in the file. CSRF needs a
+    // browser — the browser is the thing holding the cookie and attaching it
+    // automatically — and browsers always send Origin on state changes. No
+    // Origin means curl, a mobile app, or a server-side client: something with
+    // no cookie jar, therefore no ambient authority to abuse. It must present
+    // an Authorization header like anyone else.
+    const r = run({ origin: undefined });
+    assert.equal(r.nextCalled, true);
+    assert.equal(r.status, null);
+  });
+
+  test("OPTIONS is never refused", () => {
+    // A preflight is generated by the browser, not by the caller's code, and a
+    // 403 on it surfaces as an opaque CORS error — the least debuggable message
+    // we could produce.
+    const r = run({ method: "OPTIONS", origin: "https://evil.example" });
+    assert.equal(r.nextCalled, true);
+  });
+});

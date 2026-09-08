@@ -1,0 +1,72 @@
+# Continuous integration: run the test suite on every pull request.
+#
+# WHY THIS EXISTS, CONCRETELY
+# ---------------------------
+# Twice during Stage 5 a change altered behaviour and nothing went red:
+#
+#   1. The rate limiter began refusing logins BEFORE the hash, so
+#      check-auth.mjs's timing measurement quietly filled with 2ms "hashes"
+#      that were actually 429s.
+#   2. logger.js redacted err.message and let the same password through in
+#      err.stack, because a stack trace begins with the message.
+#
+# Both were caught by a person reading output carefully. That is a habit, not
+# a system, and habits fail on the day you are tired and in a hurry. This file
+# is the system.
+#
+# It is also the answer to QUIZ J9 — "a defence you get by accident is not one
+# you can rely on, because nobody knows they are removing it". Deleting the
+# Origin check in csrf.js now turns the build red instead of turning the app
+# silently insecure. Verified by doing exactly that: three tests failed.
+
+name: CI
+
+on:
+  pull_request:
+  # Also on pushes to main, so a squash-merge is checked as the commit that
+  # actually lands. A PR is tested as a MERGE of branch and base; the squashed
+  # result is a different commit and deserves its own run.
+  push:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      # A CLEAN CHECKOUT is half the value of CI, and the half you cannot get
+      # locally. Nothing from anyone's laptop: no uncommitted file, no stray
+      # node_modules, no dependency that was installed but never saved. "Works
+      # on my machine" stops being an argument when the machine is empty.
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          # Pinned, not "latest". A test suite that passes on whatever Node
+          # shipped this morning tells you nothing about the version Render is
+          # running, and a surprise upgrade is not a thing to discover during a
+          # deploy.
+          node-version: 24
+          cache: npm
+
+      # `npm ci`, never `npm install`. ci installs EXACTLY the lockfile and
+      # fails if package.json and the lock disagree — so a dependency added
+      # without committing the lockfile breaks here rather than in production.
+      # install would happily resolve something newer and hide the problem.
+      - run: npm ci
+
+      - run: npm test
+
+# WHAT THIS DELIBERATELY DOES NOT DO
+# ----------------------------------
+# - No database tests. CI has no DATABASE_URL and should not: putting
+#   production credentials in a CI secret to test against real data is how
+#   people leak databases. Testing the query layer properly needs a throwaway
+#   Postgres service, which is real work and is not this.
+# - No storage, no network, no secrets of any kind. Every test here is a pure
+#   function, which is why the suite runs in about a second.
+# - No deploy step. Render already auto-deploys on merge to main. CI's job is
+#   to make sure main deserves it.
+# - The scripts/check-*.mjs files are NOT run. They need a live server, and
+#   more importantly they print rather than assert — an instrument displays a
+#   number and hopes you look. That is exactly the gap this closes.
