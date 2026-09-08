@@ -53,6 +53,8 @@
  * second way to fall over.
  */
 
+import { logger } from "./logger.js";
+
 /**
  * All live windows, so ONE timer can sweep them all.
  *
@@ -209,10 +211,17 @@ export function rateLimit(window, { keyFn = (req) => req.ip } = {}) {
       const retryAfter = Math.max(1, Math.ceil(state.retryAfterMs / 1000));
       res.setHeader("Retry-After", String(retryAfter));
 
-      console.warn(
-        `RATE LIMIT ${window.name}: refused ${req.method} ${req.originalUrl}` +
-          ` key=${key} retryAfter=${retryAfter}s`
-      );
+      (req.log ?? logger).warn("rate limit refused", {
+        limiter: window.name,
+        method: req.method,
+        path: req.originalUrl,
+        key,
+        retryAfterSeconds: retryAfter,
+        // How many keys this window is currently tracking. Cheap, and it is
+        // the number that would reveal the unbounded-Map leak if the sweeper
+        // ever stopped running.
+        trackedKeys: window.size,
+      });
 
       // 429 Too Many Requests. Not 503: 503 means the SERVER is unavailable,
       // which invites retries and tells monitoring we are broken. 429 says the

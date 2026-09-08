@@ -16,7 +16,8 @@
     "check:password": "node scripts/check-password.mjs",
     "check:sessions": "node --env-file=.env scripts/check-sessions.mjs",
     "check:auth": "node scripts/check-auth.mjs",
-    "check:ratelimit": "node scripts/check-ratelimit.mjs"
+    "check:ratelimit": "node scripts/check-ratelimit.mjs",
+    "check:logging": "node scripts/check-logging.mjs"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.1125.0",
