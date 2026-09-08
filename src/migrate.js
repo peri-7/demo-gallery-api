@@ -71,16 +71,49 @@ async function main() {
       // runner can be so short.
       await client.query("BEGIN");
       try {
+        // THE INSERT COMES FIRST, AND THAT ORDER IS THE CONCURRENCY CONTROL.
+        //
+        // This mattered the moment migrations moved into CI. Run by hand there
+        // was one of you and you knew it. Automated, two merges a minute apart
+        // start two runners, both read schema_migrations, neither sees this
+        // file as applied, and both apply it. That is CHECK-THEN-INSERT — the
+        // exact pattern routes/auth.js refuses at signup — arriving through a
+        // new door. And migrations are rarely idempotent: `add column` fails
+        // the second time, seed data inserts twice.
+        //
+        // Inserting first makes the PRIMARY KEY the lock. A second runner
+        // reaching this line blocks on the uncommitted row until we commit,
+        // then gets 23505 and correctly skips. The `applied` set read above is
+        // only an optimisation for printing "skip"; correctness lives here,
+        // in a constraint the database enforces.
+        //
+        // An earlier version of this used pg_advisory_lock instead. It did not
+        // work, and the reason is worth keeping: our DATABASE_URL points at
+        // Neon's POOLER (PgBouncer in transaction mode), where consecutive
+        // statements can land on different backends, so a SESSION-scoped lock
+        // protects nothing. Verified — a second connection took the same lock
+        // while the first held it. A pooler is transparent until you use a
+        // session-scoped feature, and then it is silently not.
+        //
+        // This version needs no session state at all, so it is correct through
+        // a pooler, on a direct connection, and from a laptop during an
+        // incident.
+        await client.query("insert into schema_migrations (filename) values ($1)", [file]);
         await client.query(sql);
-        await client.query(
-          "insert into schema_migrations (filename) values ($1)",
-          [file]
-        );
         await client.query("COMMIT");
         console.log("ok");
         ran++;
       } catch (err) {
         await client.query("ROLLBACK");
+
+        // 23505 = unique_violation: someone else applied this file while we
+        // were working. Not an error — the desired outcome. Matching on the
+        // SQLSTATE, never the message text, for the same reason as signup.
+        if (err.code === "23505") {
+          console.log("skip (applied concurrently)");
+          continue;
+        }
+
         console.log("FAILED");
         // Stop immediately. Later migrations may assume this one succeeded,
         // so running them would compound the damage.

@@ -1,7 +1,7 @@
-# Continuous integration: run the test suite on every pull request.
+# The pipeline: test every pull request, and on main, migrate then deploy.
 #
-# WHY THIS EXISTS, CONCRETELY
-# ---------------------------
+# WHY THE TESTS EXIST, CONCRETELY
+# -------------------------------
 # Twice during Stage 5 a change altered behaviour and nothing went red:
 #
 #   1. The rate limiter began refusing logins BEFORE the hash, so
@@ -17,7 +17,20 @@
 # It is also the answer to QUIZ J9 — "a defence you get by accident is not one
 # you can rely on, because nobody knows they are removing it". Deleting the
 # Origin check in csrf.js now turns the build red instead of turning the app
-# silently insecure. Verified by doing exactly that: three tests failed.
+# silently insecure. Verified twice: three tests failed locally, and a PR
+# containing exactly that change was refused by the branch ruleset.
+#
+# WHY THE DEPLOY LIVES HERE TOO
+# -----------------------------
+# Because migrations must reach production BEFORE the code that needs them,
+# and Render's auto-deploy triggers on the same push this workflow does. Left
+# to themselves the two race, and the new code can go live against a schema
+# that is not there yet. Relying on winning that race is the same error as
+# check-then-insert.
+#
+# So Render's Auto-Deploy is OFF, and the deploy is a step gated on migrations
+# having succeeded. `needs:` is the whole point, and it only works inside one
+# workflow — which is why test/migrate/deploy are not three files.
 
 name: CI
 
@@ -28,6 +41,29 @@ on:
   # result is a different commit and deserves its own run.
   push:
     branches: [main]
+
+# Never two pipelines against production at once.
+#
+# Automating migrations introduced a race that did not exist when they were run
+# by hand: two merges a minute apart start two runners, both read
+# schema_migrations, neither sees 007 as applied, and both apply it. Most
+# migrations are not idempotent — `add column` fails the second time, seed data
+# inserts twice.
+#
+# This serialises the workflow, which is the cheap half. The real protection is
+# in src/migrate.js, which inserts the schema_migrations row BEFORE running the
+# file, so the primary key blocks a concurrent runner and the loser gets 23505
+# and skips. Verified by racing two runners at a real migration: applied once.
+#
+# The correctness must not live here. This setting only knows about GitHub
+# Actions; the migrator can also be run by a human on a laptop during an
+# incident, and that is exactly when two of them collide.
+#
+# cancel-in-progress is false on purpose. Cancelling a running migration is
+# exactly what you do not want.
+concurrency:
+  group: pipeline-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   test:
@@ -57,16 +93,98 @@ jobs:
 
       - run: npm test
 
+  # -------------------------------------------------------------------------
+  # Everything below runs ONLY on main, and only in order.
+  # -------------------------------------------------------------------------
+
+  migrate:
+    needs: test
+    # Never on a pull request. A PR from a fork gets no secrets anyway, but
+    # relying on that is relying on a platform detail; say it explicitly.
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+
+    # A GitHub Environment. Two things it buys: the secrets below are scoped to
+    # it rather than readable by every workflow in the repo, and it is where a
+    # required-reviewer rule would go if a production change ever needed a
+    # human to approve it.
+    environment: production
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+
+      # THE CREDENTIAL MOVED. IT DID NOT DISAPPEAR.
+      #
+      # It used to sit in server/.env.production on a laptop. Now it is a
+      # GitHub secret. Honestly better:
+      #
+      #   - not on a device that can be stolen, lost, or backed up somewhere
+      #   - cannot be swept up by `git add -A` in a tired moment
+      #   - rotated and revoked in one place
+      #   - access is logged
+      #   - LEAST PRIVILEGE: migrations need DATABASE_URL and nothing else, so
+      #     this is a strict subset of what the laptop file carried
+      #
+      # Honestly worse in one specific way, and worth stating plainly: anyone
+      # who can merge a change to this file can add a step that exfiltrates the
+      # secret. Repo write access is now effectively production database
+      # access. GitHub masks secrets in logs, which stops accidents, not
+      # intent. The environment above is where required reviewers would go if
+      # that trade stopped being acceptable.
+      #
+      # MIGRATIONS RUN WHILE THE OLD CODE IS STILL SERVING, so they must be
+      # backwards-compatible with it: add tables and columns, never drop or
+      # rename in the same release. Expand now, contract in a later one. Adding
+      # is safe because running code cannot reference what it does not know
+      # about; the reverse has no safe window at all.
+      - name: Run migrations
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: node src/migrate.js
+
+  deploy:
+    needs: migrate
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: production
+
+    steps:
+      # If a migration fails, this never runs and the currently deployed
+      # version keeps serving. Not deploying is a far better outcome than
+      # deploying code whose schema is not there.
+      #
+      # The hook URL is a secret: it contains a key, and anyone holding it can
+      # trigger a deploy of whatever is currently on main.
+      - name: Trigger Render deploy
+        run: |
+          status=$(curl -sS -o /dev/null -w '%{http_code}' \
+            -X POST "${{ secrets.RENDER_DEPLOY_HOOK_URL }}")
+          echo "Render responded $status"
+          # curl exits 0 on a 4xx/5xx unless told otherwise, so a refused
+          # deploy would otherwise look like a green build — the same class of
+          # silent success this whole stage is about.
+          if [ "$status" -lt 200 ] || [ "$status" -ge 300 ]; then
+            echo "Deploy hook failed"
+            exit 1
+          fi
+
 # WHAT THIS DELIBERATELY DOES NOT DO
 # ----------------------------------
-# - No database tests. CI has no DATABASE_URL and should not: putting
-#   production credentials in a CI secret to test against real data is how
-#   people leak databases. Testing the query layer properly needs a throwaway
-#   Postgres service, which is real work and is not this.
-# - No storage, no network, no secrets of any kind. Every test here is a pure
-#   function, which is why the suite runs in about a second.
-# - No deploy step. Render already auto-deploys on merge to main. CI's job is
-#   to make sure main deserves it.
+# - No database TESTS. The migrate job talks to production, but nothing here
+#   runs assertions against real data. Testing the query layer properly needs a
+#   throwaway Postgres service, which is real work and is not this.
+# - No rollback. Postgres DDL is transactional so a FAILED migration leaves
+#   nothing half-applied, but a migration that succeeds and turns out to be
+#   wrong is undone by writing the next one. There is no undo button, which is
+#   why migrations are reviewed in a PR like any other code.
+# - It does not wait for Render to finish. The hook returns as soon as the
+#   deploy is queued, so a green pipeline means "deploy started", not "deploy
+#   succeeded". Polling Render's API for the result is the honest improvement.
 # - The scripts/check-*.mjs files are NOT run. They need a live server, and
 #   more importantly they print rather than assert — an instrument displays a
 #   number and hopes you look. That is exactly the gap this closes.
