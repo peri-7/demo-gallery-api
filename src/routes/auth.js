@@ -26,8 +26,62 @@ import {
 import { createSession, destroySession } from "../sessions.js";
 import { requireAuth, sessionToken } from "../auth.js";
 import { setSessionCookie, clearSessionCookie } from "../cookies.js";
+import { SlidingWindow, rateLimit } from "../ratelimit.js";
 
 export const authRouter = Router();
+
+// ---------------------------------------------------------------------------
+// Rate limits
+// ---------------------------------------------------------------------------
+
+/**
+ * TWO LIMITERS, BECAUSE EITHER ONE ALONE HAS A DEFEAT.
+ *
+ * Per-IP alone loses to a botnet: ten thousand hosts each making three
+ * attempts is thirty thousand guesses and no host is near its limit. This is
+ * credential stuffing and it is how the attack is actually run today.
+ *
+ * Per-email alone is worse in a different direction — it lets an attacker LOCK
+ * A REAL USER OUT of their own account by deliberately failing five logins
+ * against their address. The defence becomes the attack. This is a genuine
+ * design problem with no clean answer, and the mitigations are:
+ *
+ *   1. Count only FAILURES. A user who types their password correctly is never
+ *      affected no matter how much noise someone else makes.
+ *   2. Clear the count on a successful login, so a legitimate sign-in from
+ *      anywhere ends the lockout immediately.
+ *   3. Keep the window short. Fifteen minutes of denial is an annoyance;
+ *      permanent lockout requiring support is a real outage.
+ *
+ * That still leaves a victim who cannot log in for fifteen minutes while being
+ * actively targeted. It is the accepted trade: a bounded annoyance for them,
+ * against unbounded guessing at their password.
+ */
+const authIpLimit = new SlidingWindow({
+  name: "auth-ip",
+  windowMs: 15 * 60_000,
+  max: Number.parseInt(process.env.RATE_LIMIT_AUTH_PER_IP ?? "20", 10),
+});
+
+const loginFailureLimit = new SlidingWindow({
+  name: "login-failures-per-email",
+  windowMs: 15 * 60_000,
+  max: Number.parseInt(process.env.RATE_LIMIT_LOGIN_FAILURES ?? "5", 10),
+});
+
+/**
+ * Applied to signup and login only — NOT to /me or /logout.
+ *
+ * The reason is cost, and it is the reason the limiter exists at all. Signup
+ * and login each run one scrypt hash: 300ms of CPU and 16 MiB on Render. /me is
+ * a sha256 and one indexed SELECT — microseconds. Limiting it would break the
+ * page-load session check for a user with several tabs open while defending
+ * nothing.
+ *
+ * Limit where the work is, not uniformly. A limit that is not aimed at a cost
+ * is just a smaller product.
+ */
+const limitAuthByIp = rateLimit(authIpLimit);
 
 /**
  * A real hash of a password nobody knows, computed once at boot.
@@ -107,7 +161,7 @@ function parseCredentials(body) {
 // POST /api/auth/signup
 // ---------------------------------------------------------------------------
 
-authRouter.post("/signup", async (req, res) => {
+authRouter.post("/signup", limitAuthByIp, async (req, res) => {
   const parsed = parseCredentials(req.body ?? {});
   if (parsed.errors.length > 0) {
     // Signup is the one place where telling the user exactly what is wrong is
@@ -169,7 +223,7 @@ authRouter.post("/signup", async (req, res) => {
 // POST /api/auth/login
 // ---------------------------------------------------------------------------
 
-authRouter.post("/login", async (req, res) => {
+authRouter.post("/login", limitAuthByIp, async (req, res) => {
   const parsed = parseCredentials(req.body ?? {});
   if (parsed.errors.length > 0) {
     // Note the difference from signup: no `details`. Once an account might
@@ -179,6 +233,37 @@ authRouter.post("/login", async (req, res) => {
     return res.status(400).json({ error: "Invalid credentials" });
   }
   const { email, password } = parsed.value;
+
+  /**
+   * THE FAILURE CHECK GOES HERE — BEFORE THE HASH, NOT AFTER.
+   *
+   * This is the whole point of the exercise. Checking after verifyPassword
+   * would refuse the request having already spent the 300ms and 16 MiB we were
+   * trying to protect. A limiter placed after the cost is not a limiter, it is
+   * a status code.
+   *
+   * Note that it does NOT reopen the enumeration leak Stage 4a closed. Reaching
+   * this 429 requires having already sent five failed attempts for this exact
+   * address, so it tells an attacker only what they already knew. Crucially, we
+   * record failures for addresses that DO NOT EXIST too (see below) — if we
+   * only counted real accounts, "did I get rate limited?" would become a
+   * perfect account-existence oracle, and this fast path would have undone the
+   * dummy-hash work three lines below it.
+   */
+  const failureState = loginFailureLimit.check(email);
+  if (!failureState.allowed) {
+    const retryAfter = Math.max(1, Math.ceil(failureState.retryAfterMs / 1000));
+    res.setHeader("Retry-After", String(retryAfter));
+    // The email is NOT logged. It is not a secret the way a password is, but
+    // logs are read by more people and kept longer than the database, and
+    // "which addresses are under attack" is exactly the list an attacker wants.
+    // The IP is what an operator actually needs to act on.
+    console.warn(`RATE LIMIT login-failures: refused login ip=${req.ip} retryAfter=${retryAfter}s`);
+    return res.status(429).json({
+      error: "Too many failed sign-in attempts. Try again later.",
+      retryAfterSeconds: retryAfter,
+    });
+  }
 
   // lower(email) on both sides, matching users_email_lower_key exactly. Written
   // any other way — `where email = $1` — this is a sequential scan that also
@@ -209,6 +294,13 @@ authRouter.post("/login", async (req, res) => {
     : (await verifyPassword(password, DUMMY_HASH), false);
 
   if (!ok) {
+    // Recorded on EVERY failure, including one for an address with no account.
+    // Counting only real users would make the limiter itself the enumeration
+    // oracle that the dummy hash above exists to prevent — the sixth attempt
+    // returning 429 instead of 401 would answer "does this account exist?"
+    // exactly. The limiter must be as blind as the error message.
+    loginFailureLimit.record(email);
+
     // ONE message for "no such account" and "wrong password".
     //
     // Splitting them is the single most common authentication mistake, and it
@@ -218,6 +310,17 @@ authRouter.post("/login", async (req, res) => {
     // message, every guess must be an address AND a password simultaneously.
     return res.status(401).json({ error: "Invalid email or password" });
   }
+
+  // Correct password: forget the failures. Mitigation (2) from the block at the
+  // top of this file — someone who mistypes four times and then succeeds starts
+  // clean rather than carrying a nearly-full budget for fifteen minutes.
+  //
+  // Be precise about what this does NOT do. Once the limit is already reached
+  // we return 429 above WITHOUT verifying the password, so a locked-out user
+  // cannot clear it by logging in correctly — there is no path to this line.
+  // Knowing your own password does not end an active lockout; only time does.
+  // That is the residual cost of the per-email limiter, and it is real.
+  loginFailureLimit.reset(email);
 
   // Correct password. This is the ONLY moment the plaintext is legitimately in
   // memory, so it is the only moment the stored hash can be upgraded to a

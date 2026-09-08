@@ -171,19 +171,62 @@ show("logout again", await call("POST", "/api/auth/logout", { token }));
 // The interesting measurement. If the "no such user" path skipped the password
 // hash, this would show ~2ms against ~35ms and anyone could enumerate accounts
 // without guessing a single password. Both paths hash, so both cost the same.
+// STAGE 5 CHANGED THIS MEASUREMENT, AND THE FIRST RUN LOOKED LIKE A REGRESSION.
+//
+// The per-email failed-login limiter refuses after 5 failures, and it refuses
+// BEFORE hashing — which is the entire point of where it sits. So attempts 6
+// and 7 come back in 2ms with a 429, and dropping those into the sample set
+// produced a row reading "165, 204, 213, 164, 799, 2". The 2 is not a fast
+// hash. It is no hash at all.
+//
+// Two things to take from that. First, a 429 is not a login attempt and must
+// not be averaged with them — so they are separated out below rather than
+// silently skewing a median. Second, and more useful: adding a defence changed
+// what an existing check was measuring, and nothing failed. If this script
+// asserted instead of printing, that would have been caught automatically.
+// It does not, which is exactly the gap CI is about to close.
 console.log("\ntiming — can an outsider tell whether an account exists?");
 const samples = 6;
 const timings = { real: [], ghost: [] };
 for (let i = 0; i < samples; i++) {
-  timings.real.push((await call("POST", "/api/auth/login", { body: { email, password: "wrong password here" } })).ms);
-  timings.ghost.push((await call("POST", "/api/auth/login", { body: { email: "ghost@example.invalid", password } })).ms);
+  const real = await call("POST", "/api/auth/login", { body: { email, password: "wrong password here" } });
+  const ghost = await call("POST", "/api/auth/login", { body: { email: "ghost@example.invalid", password } });
+  timings.real.push({ ms: real.ms, status: real.status });
+  timings.ghost.push({ ms: ghost.ms, status: ghost.status });
 }
 const median = (xs) => [...xs].sort((a, b) => a - b)[Math.floor(xs.length / 2)];
-console.log(`  existing account, wrong password : median ${median(timings.real)}ms   ${timings.real.join(", ")}`);
-console.log(`  no such account                  : median ${median(timings.ghost)}ms   ${timings.ghost.join(", ")}`);
+function report(label, rows) {
+  const hashed = rows.filter((r) => r.status !== 429).map((r) => r.ms);
+  const refused = rows.length - hashed.length;
+  const shown = hashed.length === 0 ? "n/a" : `${median(hashed)}ms`;
+  console.log(
+    `  ${label} : median ${shown.padEnd(7)} ${hashed.join(", ")}` +
+      (refused > 0 ? `   (+${refused} refused 429, excluded)` : "")
+  );
+}
+report("existing account, wrong password", timings.real);
+report("no such account                 ", timings.ghost);
+if (timings.real.every((r) => r.status === 429)) {
+  console.log(`
+  ^ EVERY sample was refused, so nothing was measured. This script makes more
+    signup+login calls than RATE_LIMIT_AUTH_PER_IP allows, which is the limiter
+    working correctly on a caller that looks exactly like a brute-forcer.
+    To measure the timing, restart the server with the limits relaxed:
+
+      RATE_LIMIT_AUTH_PER_IP=200 RATE_LIMIT_LOGIN_FAILURES=100 npm run dev
+
+    Note what you must NOT do: relax the limit inside the server for requests
+    that look like this script. A limiter with an exemption for "our own tools"
+    is a limiter with a documented bypass.`);
+}
 console.log(`
 Both paths run one scrypt hash. The gap should be noise, not signal — if the
 second row were consistently faster, the endpoint would be answering "does this
 address have an account here?" to anyone who asked, without a single password
 guess.
+
+The 429s are excluded above, and note that BOTH rows collect them. That symmetry
+matters: a limiter that only counted real accounts would answer the same
+question the dummy hash exists to hide, just with a status code instead of a
+stopwatch. Raise RATE_LIMIT_LOGIN_FAILURES if you want more hashed samples.
 `);
